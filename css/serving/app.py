@@ -14,6 +14,11 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
+import time
+import uuid
+
+from comet_mpm import CometMPM
 from flask import Flask, request
 import pandas as pd
 
@@ -30,30 +35,57 @@ def ping():
     return {"message": "ok"}
 
 
+def _log_predictions(dataframe, input_data):
+    mpm = CometMPM(
+        workspace_name="collin-cunningham",
+        model_name="css-model",
+        model_version="1.0.0",
+        api_key=os.env.get('API_KEY'),
+    )
+    for (_, row), (_, input_row) in zip(
+        dataframe.iterrows(), input_data.iterrows(), strict=False
+    ):
+        input_features = row.xs("metric", level=2)
+        input_features.index = [f"{c[0]}__{c[1]}" for c in input_features.index]
+        output_features = row.xs("metric", level=2)
+        output_features.index = [f"{c[0]}__{c[1]}" for c in output_features.index]
+        input_features_dict = input_features.to_dict()
+        input_features_dict["salesforce__acct_age"] = input_row["acct_age"]
+        input_features_dict["salesforce__acct_size"] = input_row["acct_size"]
+        output_features_dict = output_features.to_dict()
+        mpm.log_event(
+            prediction_id=str(uuid.uuid4()),
+            input_features=input_features_dict,
+            output_value=0,
+            output_features=output_features_dict,
+            timestamp=time.time(),
+        )
+    mpm.end()
+
+
 @app.post("/invocations")
 def invocations():
     """Model invoke endpoint."""
-    try:
-        input_data = decode(request.data, request.content_type)
-        model = ModelCache.model()
-        if set(model.min_required_columns).issubset(input_data.columns):
-            predictions = model.score(input_data)
-        elif len(model.min_required_columns) == input_data.shape[1]:
-            input_data.columns = model.min_required_columns
-            predictions = model.score(input_data)
-        else:
-            message = (
-                f"Model requires columns {model.min_required_columns}, "
-                f"but received columns {input_data.columns}. If you pass unlabeled "
-                "data, it must match exactly the dimensionality and ordering "
-                f"of `min_required_columns`."
-            )
-            return {"message": message}, 400
-    except Exception as e:
-        return {"message": str(e)}, 500
+    input_data = decode(request.data, request.content_type)
+    model = ModelCache.model()
+    if set(model.min_required_columns).issubset(input_data.columns):
+        predictions = model.score(input_data)
+        _log_predictions(predictions, input_data)
+    elif len(model.min_required_columns) == input_data.shape[1]:
+        input_data.columns = model.min_required_columns
+        predictions = model.score(input_data)
+        _log_predictions(predictions, input_data)
     else:
-        predictions["last_modified"] = pd.Timestamp.now().isoformat()
-        return encode(predictions, request.accept_mimetypes)
+        message = (
+            f"Model requires columns {model.min_required_columns}, "
+            f"but received columns {input_data.columns}. If you pass unlabeled "
+            "data, it must match exactly the dimensionality and ordering "
+            f"of `min_required_columns`."
+        )
+        return {"message": message}, 400
+
+    predictions["last_modified"] = pd.Timestamp.now().isoformat()
+    return encode(predictions, request.accept_mimetypes)
 
 
 def start_server():

@@ -24,6 +24,7 @@ from typing import (
     TypeVar,
 )
 
+import comet_ml
 import numpy as np
 import pandas as pd
 import scipy.stats as ss
@@ -167,6 +168,7 @@ class BaseMetric(BaseScoringInterface, post_fit_attrs=["nonzero_count"]):
     ) -> None:
         self.name = name
         self._extended_logger_name = name
+        self._comet_experiment = comet_ml.get_running_experiment()
 
     @property
     def _logger(self) -> logging.Logger:
@@ -395,6 +397,22 @@ class InterpolatedPeerMetric(
         self.reps = reps
         self.param_model.fit(reps, fit_params)
 
+        self._comet_experiment.log_parameters(
+            {
+                "peer_dims": self._peer_dims,
+                "n_neighbors": self._n_neighbors,
+                "trim_samples": self._trim_samples,
+                "n_reps_per_dim": self._n_reps_per_dim,
+                "min": self._min,
+                "max": self._max,
+                "trim_min": self._trim_min,
+                "trim_max": self._trim_max,
+                "floc": self._floc,
+                "fscale": self._fscale,
+                "semantic_flip": self._semantic_flip,
+            }
+        )
+
         r2 = self.param_model.r2
         if r2 > self.R2_GREEN_GE:
             self._logger.info(f"Model fit: R^2={r2:.2f}")
@@ -402,8 +420,13 @@ class InterpolatedPeerMetric(
             self._logger.warning(f"Model fit: R^2={r2:.2f}")
         else:
             self._logger.critical(f"High risk model fit! R^2={r2:.2f}")
-
+        self.r2 = r2
         self.nonzero_count = (dataframe[self.name] > 0).sum()
+
+        self._comet_experiment.log_metric("R^2", r2)
+        self._comet_experiment.log_metric(
+            "nonzero_count", (dataframe[self.name] > 0).sum()
+        )
         return self
 
     def _compute_dist(
@@ -706,7 +729,10 @@ class BaseWeightedCombinationScorer(
             include column names that match the names of the ``BaseMetric`` descendants.
         """
         for obj in self.children.values():
-            obj.fit(dataframe)
+            comet_experiment = comet_ml.get_running_experiment()
+
+            with comet_experiment.context_manager(obj.name):
+                obj.fit(dataframe)
         return self
 
     def score(
@@ -742,6 +768,13 @@ class BaseWeightedCombinationScorer(
 
     def __getitem__(self, child_name: str) -> _ChildrenT:
         return self.children[child_name]
+
+    def _repr_html_(self) -> str:
+        from css.render import html_repr
+
+        return html_repr(self)
+
+    def _visual_block_(self) -> "_VisualBlock": ...
 
 
 class Component(BaseWeightedCombinationScorer[BaseMetric]):
@@ -811,6 +844,17 @@ class Component(BaseWeightedCombinationScorer[BaseMetric]):
         else:
             return self._weights
 
+    def _visual_block_(self) -> "_VisualBlock":
+        from css.render import _VisualBlock
+
+        return _VisualBlock(
+            "parallel",
+            list(self.children.values()),
+            names=None,
+            name_details=None,
+            dash_wrapped=True,
+        )
+
 
 class GlobalScore(BaseWeightedCombinationScorer[Component]):
     """Holds the outermost level of the scoring hierarchy.
@@ -842,3 +886,17 @@ class GlobalScore(BaseWeightedCombinationScorer[Component]):
             weights = [1] * len(self.children)
         weights_series = pd.Series(weights, index=list(self.children.keys()))
         self._weights = weights_series / weights_series.sum()
+
+    def _visual_block_(self) -> "_VisualBlock":
+        from css.render import _VisualBlock
+
+        estimators = list(self.children.values())
+        names = list(self.children.keys())
+        name_details = [str(est) for est in estimators]
+        return _VisualBlock(
+            "parallel",
+            estimators,
+            names=names,
+            name_details=name_details,
+            dash_wrapped=True,
+        )
